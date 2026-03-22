@@ -2,6 +2,7 @@ import os
 import glob
 import json
 import time
+import inspect
 import asyncio
 from typing import NamedTuple, Optional
 
@@ -21,17 +22,50 @@ class ProofPaths(NamedTuple):
     proof: str
 
 
-def resolve_proof_paths(proof_dir: str, base_name: str) -> Optional[ProofPaths]:
+def resolve_proof_paths(
+    proof_dir: str, base_name: str, setup_dir: Optional[str] = None
+) -> Optional[ProofPaths]:
     """Retrieves paths for all required proof-related files given a directory and base name."""
+    setup_root = setup_dir or proof_dir
     return ProofPaths(
-        circuit=os.path.join(proof_dir, f"{base_name}.ezkl"),
-        settings=os.path.join(proof_dir, f"{base_name}_settings.json"),
-        srs=os.path.join(proof_dir, "kzg.srs"),
-        verification_key=os.path.join(proof_dir, f"{base_name}.vk"),
-        proving_key=os.path.join(proof_dir, f"{base_name}.pk"),
+        circuit=os.path.join(setup_root, f"{base_name}.ezkl"),
+        settings=os.path.join(setup_root, f"{base_name}_settings.json"),
+        srs=os.path.join(setup_root, "kzg.srs"),
+        verification_key=os.path.join(setup_root, f"{base_name}.vk"),
+        proving_key=os.path.join(setup_root, f"{base_name}.pk"),
         witness=os.path.join(proof_dir, f"{base_name}_witness.json"),
         proof=os.path.join(proof_dir, f"{base_name}.pf"),
     )
+
+
+def _prove_with_compat(
+    witness_file: str,
+    circuit_name: str,
+    pk_file: str,
+    proof_file: str,
+    srs_file: str,
+) -> bool:
+    """Calls ezkl.prove across API versions with/without proof type argument."""
+    try:
+        sig = inspect.signature(ezkl.prove)
+        if "proof_type" in sig.parameters:
+            return ezkl.prove(
+                witness=witness_file,
+                model=circuit_name,
+                pk_path=pk_file,
+                proof_path=proof_file,
+                srs_path=srs_file,
+                proof_type="single",
+            )
+    except (TypeError, ValueError):
+        pass
+
+    try:
+        return ezkl.prove(witness_file, circuit_name, pk_file, proof_file, srs_file)
+    except TypeError:
+        return ezkl.prove(
+            witness_file, circuit_name, pk_file, proof_file, "single", srs_file
+        )
 
 
 def batch_verify_proofs(
@@ -88,6 +122,7 @@ async def generate_proofs(
     onnx_dir: str = "lora_onnx_params",
     json_dir: str = "intermediate_activations",
     output_dir: str = "proof_artifacts",
+    setup_dir: Optional[str] = None,
     verbose: bool = False,
 ) -> Optional[tuple[float, float, float, int, int]]:
     """Asynchronously scans onnx_dir for .onnx files and json_dir for .json files.
@@ -101,6 +136,7 @@ async def generate_proofs(
         onnx_dir: Directory containing ONNX model files
         json_dir: Directory containing input JSON files
         output_dir: Directory to store proof artifacts (default: current directory)
+        setup_dir: Optional directory for reusable setup artifacts (.ezkl/.vk/.pk/.srs)
 
     Returns:
         - total_settings_time: Total time spent on settings/setup
@@ -110,6 +146,8 @@ async def generate_proofs(
     """
 
     os.makedirs(output_dir, exist_ok=True)
+    if setup_dir:
+        os.makedirs(setup_dir, exist_ok=True)
 
     onnx_files = glob.glob(os.path.join(onnx_dir, "*.onnx"))
     if not onnx_files:
@@ -143,7 +181,7 @@ async def generate_proofs(
             print(f"Number of parameters: {param_count:,}")
         total_params += param_count
 
-        names = resolve_proof_paths(output_dir, base_name)
+        names = resolve_proof_paths(output_dir, base_name, setup_dir=setup_dir)
         if names is None:
             continue
         (
@@ -162,22 +200,32 @@ async def generate_proofs(
         py_args.param_visibility = "private"
         py_args.logrows = 20
 
-        if verbose:
-            print("Generating settings & compiling circuit...")
-        start_time = time.time()
+        has_setup_artifacts = (
+            os.path.isfile(circuit_name)
+            and os.path.isfile(settings_file)
+            and os.path.isfile(vk_file)
+            and os.path.isfile(pk_file)
+            and os.path.isfile(srs_file)
+        )
+        if not has_setup_artifacts:
+            if verbose:
+                print("Generating settings & compiling circuit...")
+            start_time = time.time()
 
-        # 1) gen_settings + compile_circuit
-        ezkl.gen_settings(onnx_path, settings_file, py_run_args=py_args)
-        ezkl.compile_circuit(onnx_path, circuit_name, settings_file)
+            # 1) gen_settings + compile_circuit
+            ezkl.gen_settings(onnx_path, settings_file, py_run_args=py_args)
+            ezkl.compile_circuit(onnx_path, circuit_name, settings_file)
 
-        # 2) SRS + setup
-        if not os.path.isfile(srs_file):
-            ezkl.gen_srs(srs_file, py_args.logrows)
-        ezkl.setup(circuit_name, vk_file, pk_file, srs_file)
-        end_time = time.time()
-        if verbose:
-            print(f"Setup for {base_name} took {end_time - start_time:.2f} sec")
-        total_settings_time += end_time - start_time
+            # 2) SRS + setup
+            if not os.path.isfile(srs_file):
+                ezkl.gen_srs(srs_file, py_args.logrows)
+            ezkl.setup(circuit_name, vk_file, pk_file, srs_file)
+            end_time = time.time()
+            if verbose:
+                print(f"Setup for {base_name} took {end_time - start_time:.2f} sec")
+            total_settings_time += end_time - start_time
+        elif verbose:
+            print(f"Reusing setup artifacts for {base_name}")
 
         # Local check
         with open(json_path, "r") as f:
@@ -219,8 +267,12 @@ async def generate_proofs(
         if verbose:
             print("Generating proof...")
         start_time = time.time()
-        prove_ok = ezkl.prove(
-            witness_file, circuit_name, pk_file, proof_file, "single", srs_file
+        prove_ok = _prove_with_compat(
+            witness_file=witness_file,
+            circuit_name=circuit_name,
+            pk_file=pk_file,
+            proof_file=proof_file,
+            srs_file=srs_file,
         )
         end_time = time.time()
         if verbose:
@@ -233,7 +285,8 @@ async def generate_proofs(
 
         if verbose:
             print(f"Done with {base_name}.\n")
-        os.remove(pk_file)
+        if not setup_dir and os.path.isfile(pk_file):
+            os.remove(pk_file)
         count_onnx_files += 1
 
     return (
