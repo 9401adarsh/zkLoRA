@@ -1,15 +1,15 @@
-import os
-import glob
-import json
-import time
-import inspect
 import asyncio
+import glob
+import inspect
+import json
+import os
+import time
 from typing import NamedTuple, Optional
 
+import ezkl
 import numpy as np
 import onnx
 import onnxruntime
-import ezkl
 
 
 class ProofPaths(NamedTuple):
@@ -38,25 +38,51 @@ def resolve_proof_paths(
     )
 
 
+def _validate_backend(backend: str) -> str:
+    normalized = str(backend).strip().lower()
+    if normalized not in {"cpu", "gpu"}:
+        raise ValueError("backend must be one of {cpu, gpu}")
+    return normalized
+
+
+def _ensure_gpu_backend_available() -> None:
+    try:
+        import torch
+    except Exception as exc:  # pragma: no cover - environment dependent
+        raise RuntimeError("gpu backend requested but torch is unavailable") from exc
+    if not torch.cuda.is_available():
+        raise RuntimeError("gpu backend requested but CUDA runtime is unavailable")
+
+
 def _prove_with_compat(
     witness_file: str,
     circuit_name: str,
     pk_file: str,
     proof_file: str,
     srs_file: str,
+    backend: str = "cpu",
 ) -> bool:
     """Calls ezkl.prove across API versions with/without proof type argument."""
+    backend = _validate_backend(backend)
+
     try:
         sig = inspect.signature(ezkl.prove)
-        if "proof_type" in sig.parameters:
-            return ezkl.prove(
-                witness=witness_file,
-                model=circuit_name,
-                pk_path=pk_file,
-                proof_path=proof_file,
-                srs_path=srs_file,
-                proof_type="single",
-            )
+        params = sig.parameters
+        if {"witness", "model", "pk_path", "proof_path", "srs_path"}.issubset(
+            params.keys()
+        ):
+            kwargs = {
+                "witness": witness_file,
+                "model": circuit_name,
+                "pk_path": pk_file,
+                "proof_path": proof_file,
+                "srs_path": srs_file,
+            }
+            if "proof_type" in params:
+                kwargs["proof_type"] = "single"
+            if "backend" in params:
+                kwargs["backend"] = backend
+            return ezkl.prove(**kwargs)
     except (TypeError, ValueError):
         pass
 
@@ -123,6 +149,7 @@ async def generate_proofs(
     json_dir: str = "intermediate_activations",
     output_dir: str = "proof_artifacts",
     setup_dir: Optional[str] = None,
+    backend: str = "cpu",
     verbose: bool = False,
 ) -> Optional[tuple[float, float, float, int, int]]:
     """Asynchronously scans onnx_dir for .onnx files and json_dir for .json files.
@@ -137,6 +164,7 @@ async def generate_proofs(
         json_dir: Directory containing input JSON files
         output_dir: Directory to store proof artifacts (default: current directory)
         setup_dir: Optional directory for reusable setup artifacts (.ezkl/.vk/.pk/.srs)
+        backend: Proof backend hint. One of {cpu, gpu}.
 
     Returns:
         - total_settings_time: Total time spent on settings/setup
@@ -144,6 +172,9 @@ async def generate_proofs(
         - total_prove_time: Total time spent generating proofs
         - count_onnx_files: Number of ONNX files successfully processed
     """
+    backend = _validate_backend(backend)
+    if backend == "gpu":
+        _ensure_gpu_backend_available()
 
     os.makedirs(output_dir, exist_ok=True)
     if setup_dir:
@@ -273,6 +304,7 @@ async def generate_proofs(
             pk_file=pk_file,
             proof_file=proof_file,
             srs_file=srs_file,
+            backend=backend,
         )
         end_time = time.time()
         if verbose:
